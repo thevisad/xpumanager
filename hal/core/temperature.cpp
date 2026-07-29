@@ -10,6 +10,11 @@
 #include <map>
 #include <memory>
 #include <vector>
+#include <string>
+#include <fstream>
+#include <cstring>
+#include <cstdio>
+#include <dirent.h>
 
 /**
  * @brief Helper function to parse device ID from hexadecimal string
@@ -444,10 +449,66 @@ ze_result_t temperature::getTempPerTile(zes_temp_sensors_t type, std::map<uint32
  * @param coreTemp Pointer to store the GPU core temperature in Celsius
  * @return ze_result_t ZE_RESULT_SUCCESS if core temperature retrieved successfully, error code otherwise
  */
+void temperature::resolveSysfsHwmon(zes_device_handle_t device) {
+	sysfsHwmonDir.clear();
+	zes_pci_properties_t pci{};
+	pci.stype = ZES_STRUCTURE_TYPE_PCI_PROPERTIES;
+	if (zesDevicePciGetProperties(device, &pci) != ZE_RESULT_SUCCESS)
+		return;
+	char bdf[40];
+	snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", pci.address.domain,
+		pci.address.bus, pci.address.device, pci.address.function);
+	std::string base = std::string("/sys/bus/pci/devices/") + bdf + "/hwmon";
+	DIR *dir = opendir(base.c_str());
+	if (!dir)
+		return;
+	struct dirent *ent;
+	while ((ent = readdir(dir)) != nullptr) {
+		if (strncmp(ent->d_name, "hwmon", 5) == 0) {
+			sysfsHwmonDir = base + "/" + ent->d_name;
+			break;
+		}
+	}
+	closedir(dir);
+}
+
+ze_result_t temperature::readSysfsTemp(const char *label, double *temp) {
+	if (sysfsHwmonDir.empty() || temp == nullptr)
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	DIR *dir = opendir(sysfsHwmonDir.c_str());
+	if (!dir)
+		return ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	struct dirent *ent;
+	ze_result_t result = ZE_RESULT_ERROR_UNSUPPORTED_FEATURE;
+	while ((ent = readdir(dir)) != nullptr) {
+		const char *suffix = strstr(ent->d_name, "_label");
+		if (!suffix || strncmp(ent->d_name, "temp", 4) != 0)
+			continue;
+		std::ifstream lf(sysfsHwmonDir + "/" + ent->d_name);
+		std::string content;
+		std::getline(lf, content);
+		if (content != label)
+			continue;
+		std::string prefix(ent->d_name, suffix - ent->d_name);
+		std::ifstream vf(sysfsHwmonDir + "/" + prefix + "_input");
+		long milli = 0;
+		if (vf >> milli) {
+			*temp = milli / 1000.0;
+			result = ZE_RESULT_SUCCESS;
+		}
+		break;
+	}
+	closedir(dir);
+	return result;
+}
+
 ze_result_t temperature::getCoreTemp(double *coreTemp)
 {
 	TRACING();
-	return getTemp(ZES_TEMP_SENSORS_GPU, coreTemp);
+	ze_result_t result = getTemp(ZES_TEMP_SENSORS_GPU, coreTemp);
+	if (result != ZE_RESULT_SUCCESS)
+		result = readSysfsTemp("pkg", coreTemp); // sysfs fallback (Battlemage/xe)
+	return result;
 }
 
 /**
@@ -464,6 +525,8 @@ ze_result_t temperature::getMemoryTemp(double *memTemp)
 {
 	TRACING();
 	ze_result_t result = getTemp(ZES_TEMP_SENSORS_MEMORY, memTemp);
+	if (result != ZE_RESULT_SUCCESS)
+		return readSysfsTemp("vram", memTemp); // sysfs fallback, already Celsius
 	// LPDDR5 reports an MR4 thermal code (0..7); convert to Celsius.
 	if (result == ZE_RESULT_SUCCESS && hasLpddr5Memory && memTemp != nullptr) {
 		*memTemp = mr4CodeToCelsius(*memTemp);
@@ -546,6 +609,7 @@ ze_result_t temperature::init(zes_device_handle_t device)
 {
 	TRACING();
 	ze_result_t result = enumTemperatureDomains(device);
+	resolveSysfsHwmon(device);
 	// Detect LPDDR5 memory so memory-temp getters can convert the MR4 thermal
 	// code reported by the device into a Celsius value. Best-effort: the result
 	// is intentionally ignored so a detection failure does not mask the

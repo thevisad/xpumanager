@@ -69,6 +69,13 @@ private:
 	// memory-temperature getters to convert MR4 -> max-of-range Celsius.
 	bool hasLpddr5Memory;
 
+	// Battlemage/xe (and others) expose temperature via the PCI device's
+	// hwmon node even when Level Zero sysman enumerates no matching sensor.
+	// Cache that dir at init and read it as a fallback.
+	std::string sysfsHwmonDir;
+	void resolveSysfsHwmon(zes_device_handle_t device);
+	ze_result_t readSysfsTemp(const char *label, double *temp);
+
 	void loadTemperatureThresholds();
 	void loadThresholdSection(const nlohmann::json &thresholdsJson, const std::string &key,
 							  std::function<void(uint32_t, uint64_t)> setter);
