@@ -436,6 +436,19 @@ ze_result_t temperature::getTempPerTile(zes_temp_sensors_t type, std::map<uint32
 		}
 	}
 
+	// sysfs fallback for getTempPerTile (Battlemage/xe): Level Zero sysman enumerates no
+	// temperature sensor, so the loop above leaves tileTemperatures empty and stats/dump show
+	// N/A. Read the PCI device hwmon node instead (same source as getCoreTemp/getMemoryTemp).
+	if (tileTemperatures.empty()) {
+		const char *sysfsLabel = (type == ZES_TEMP_SENSORS_GPU)      ? "pkg"
+		                       : (type == ZES_TEMP_SENSORS_MEMORY)   ? "vram"
+		                                                             : nullptr;
+		double sysfsTemp = 0.0;
+		if (sysfsLabel != nullptr && readSysfsTemp(sysfsLabel, &sysfsTemp) == ZE_RESULT_SUCCESS
+			&& sysfsTemp < MAX_REASONABLE_TEMP_CELSIUS) {
+			tileTemperatures[0] = sysfsTemp;
+		}
+	}
 	return ZE_RESULT_SUCCESS;
 }
 
